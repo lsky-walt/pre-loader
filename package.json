@@ -1,6 +1,6 @@
 {
   "name": "@lsky/pre-plugin",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "main": "index.js",
   "repository": "git@github.com:lsky-walt/pre-plugin.git",
   "author": "lsky-walt <lsky_walt@163.com>",
