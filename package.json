@@ -1,5 +1,5 @@
 {
-  "name": "@lsky/pre-loader",
+  "name": "@lsky/magic-loader",
   "version": "0.0.1",
   "main": "index.js",
   "repository": "git@github.com:lsky-walt/pre-plugin.git",
@@ -7,7 +7,6 @@
   "license": "MIT",
   "devDependencies": {},
   "dependencies": {
-    "jsdom": "^19.0.0",
     "memory-fs": "^0.5.0",
     "webpack": "^5.65.0"
   },

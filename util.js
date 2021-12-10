@@ -44,10 +44,6 @@ function getBestModuleExport(exports) {
   }
 }
 
-function stringToModule(str) {
-  return "export default " + JSON.stringify(str)
-}
-
 function normalizeEntry(context, entry, prefix = "") {
   if (entry && typeof entry === "object") {
     return Object.keys(entry).reduce((acc, key) => {
@@ -99,7 +95,6 @@ module.exports = {
   runChildCompiler,
   getRootCompiler,
   getBestModuleExport,
-  stringToModule,
   normalizeEntry,
   applyEntry,
 }

@@ -1,47 +1,67 @@
 const os = require("os")
-const jsdom = require("jsdom")
 const LibraryTemplatePlugin = require("webpack/lib/LibraryTemplatePlugin")
 const NodeTemplatePlugin = require("webpack/lib/node/NodeTemplatePlugin")
 const NodeTargetPlugin = require("webpack/lib/node/NodeTargetPlugin")
-const DefinePlugin = require("webpack/lib/DefinePlugin")
 const MemoryFs = require("memory-fs")
 const {
   runChildCompiler,
   getRootCompiler,
-  getBestModuleExport,
-  stringToModule,
   normalizeEntry,
   applyEntry,
 } = require("./util")
+const fs = require("fs")
+const path = require("path")
+const { spawn } = require("child_process")
 
-const PLUGIN_NAME = "prerender-loader"
+const PLUGIN_NAME = "magic-loader"
 
-const FILENAME = "ssr-bundle.js"
+const FILENAME = "ssg-bundle.js"
 
-const PRERENDER_REG = /\{\{prerender(?::\s*([^}]+?)\s*)?\}\}/
+const HTML_TAG = /\{\{HTML(?::\s*([^}]+?)\s*)?\}\}/
+
+const promiseSpawnWithReturnData = ({ command = "", args = [], option = {} }) =>
+  new Promise((resolve, reject) => {
+    if (!command || args.length <= 0) {
+      console.log("Error: Incomplete parameters")
+      console.log()
+      reject(new Error("Error: Incomplete parameters"))
+      process.exit(1)
+    }
+    console.log(`exec command: ${command} ${args.join(" ")}`)
+    const child = spawn(command, args, { ...option })
+    let data = ""
+    child.stdout &&
+      child.stdout.on("data", (msg) => {
+        data += msg
+      })
+    child.on("error", (err) => {
+      console.error(err)
+      reject(err)
+    })
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject({
+          command: `${command} ${args.join(" ")}`,
+        })
+        return
+      }
+      resolve(data)
+    })
+  })
 
 function PrerenderLoader(content) {
   const options = this.getOptions() || {}
-  const outputFilter =
-    options.as === "string" || options.string ? stringToModule : String
+  const outputFilter = (str) => "export default " + JSON.stringify(str)
 
-  if (options.disabled === true) {
-    return outputFilter(content)
+  const matches = content.match(HTML_TAG)
+  if (matches) {
+    options.entry = matches[1] || options.entry
   }
-
-  let inject = false
-  if (!this.request.match(/\.(js|ts)x?$/i)) {
-    const matches = content.match(PRERENDER_REG)
-    if (matches) {
-      inject = true
-      options.entry = matches[1] || options.entry
-    }
-    options.templateContent = content
-  }
+  options.templateContent = content
 
   const callback = this.async()
 
-  prerender(this._compilation, this.request, options, inject, this)
+  prerender(this._compilation, this.request, options)
     .then((output) => {
       callback(null, outputFilter(output))
     })
@@ -50,7 +70,7 @@ function PrerenderLoader(content) {
     })
 }
 
-async function prerender(parentCompilation, request, options, inject, loader) {
+async function prerender(parentCompilation, request, options) {
   const parentCompiler = getRootCompiler(parentCompilation.compiler)
   const context = parentCompiler.options.context || process.cwd()
   const customEntry =
@@ -77,137 +97,152 @@ async function prerender(parentCompilation, request, options, inject, loader) {
   compiler.context = parentCompiler.context
   compiler.outputFileSystem = new MemoryFs()
 
-  new DefinePlugin({
-    PRERENDER: "true",
-  }).apply(compiler)
-
-  new DefinePlugin({
-    PRERENDER: "false",
-  }).apply(parentCompiler)
-
   new NodeTemplatePlugin(outputOptions).apply(compiler)
   new NodeTargetPlugin().apply(compiler)
 
-  new LibraryTemplatePlugin("PRERENDER_RESULT", "var").apply(compiler)
+  new LibraryTemplatePlugin(undefined, "umd").apply(compiler)
 
   applyEntry(context, entry, compiler)
 
-  const compilation = await runChildCompiler(compiler)
-  let result
-  let dom, window, injectParent, injectNextSibling
+  // change some options
+  compiler.options.externalsPresets = {
+    ...compiler.options.externalsPresets,
+    web: false,
+    node: true,
+  }
+  compiler.options.externalsType = "umd"
+  compiler.options.loader.target = "node"
+  compiler.options.node = {
+    global: false,
+    __filename: "eval-only",
+    __dirname: "eval-only",
+  }
 
-  function BrokenPromise() {}
-  BrokenPromise.prototype.then =
-    BrokenPromise.prototype.catch =
-    BrokenPromise.prototype.finally =
-      () => new BrokenPromise()
+  compiler.options.output = {
+    ...compiler.options.output,
+    chunkFormat: "commonjs",
+    enabledChunkLoadingTypes: ["require"],
+    enabledLibraryTypes: ["umd"],
+    enabledWasmLoadingTypes: ["async-node"],
+    globalObject: "global",
+    scriptType: false,
+    library: {
+      type: "umd",
+    },
+    wasmLoading: "async-node",
+    workerChunkLoading: "require",
+    workerWasmLoading: "async-node",
+  }
+
+  compiler.options.performance = false
+  compiler.options.resolve = {
+    ...compiler.options.resolve,
+    byDependency: {
+      wasm: {
+        conditionNames: ["import", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      esm: {
+        conditionNames: ["import", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      loaderImport: {
+        conditionNames: ["import", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      worker: {
+        conditionNames: ["import", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+        preferRelative: true,
+      },
+      commonjs: {
+        conditionNames: ["require", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      amd: {
+        conditionNames: ["require", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      loader: {
+        conditionNames: ["require", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      unknown: {
+        conditionNames: ["require", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      undefined: {
+        conditionNames: ["require", "module", "..."],
+        aliasFields: [],
+        mainFields: ["module", "..."],
+      },
+      url: {
+        preferRelative: true,
+      },
+    },
+    cache: false,
+    modules: ["node_modules"],
+    conditionNames: ["webpack", "production", "node"],
+    mainFiles: ["index"],
+    extensions: [".", ".ts", ".tsx", ".js", ".jsx", ".json"],
+    aliasFields: [],
+    exportsFields: ["exports"],
+    mainFields: ["main"],
+  }
+
+  compiler.options.target = "node"
+
+  const compilation = await runChildCompiler(compiler)
+
+  let result = ""
+
+  // out put write to tmp folder
+  let tmpdir = path.join(outputOptions.path, `ssg-${+new Date()}`)
+  fs.mkdirSync(tmpdir)
 
   if (compilation.assets[compilation.options.output.filename]) {
     const output =
       compilation.assets[compilation.options.output.filename].source()
 
+    fs.writeFileSync(path.join(tmpdir, "ssg-source.js"), output, "utf8")
+    fs.writeFileSync(
+      path.join(tmpdir, "index.js"),
+      `
+    const ssg = require("./ssg-source.js")
+    console.log(ssg.app())
+    `,
+      "utf8"
+    )
+    // 执行 index.js
+    const msg = await promiseSpawnWithReturnData({
+      command: "node",
+      args: ["index.js"],
+      option: {
+        cwd: tmpdir,
+      },
+    })
+
     const tpl =
       options.templateContent ||
       "<!DOCTYPE html><html><head></head><body></body></html>"
-    dom = new jsdom.JSDOM(
-      tpl.replace(PRERENDER_REG, '<div id="PRERENDER_INJECT"></div>'),
-      {
-        virtualConsole: new jsdom.VirtualConsole({
-          omitJSDOMErrors: false,
-        }).sendTo(console),
-
-        url: options.documentUrl || "http://localhost",
-
-        includeNodeLocations: false,
-
-        runScripts: "outside-only",
-      }
-    )
-    window = dom.window
-
-    const injectPlaceholder = window.document.getElementById("PRERENDER_INJECT")
-    if (injectPlaceholder) {
-      injectParent = injectPlaceholder.parentNode
-      injectNextSibling = injectPlaceholder.nextSibling
-      injectPlaceholder.remove()
-    }
-
-    let counter = 0
-    window.requestAnimationFrame = () => ++counter
-    window.cancelAnimationFrame = () => {}
-
-    window.customElements = {
-      define() {},
-      get() {},
-      upgrade() {},
-      whenDefined: () => new BrokenPromise(),
-    }
-
-    window.MessagePort = function () {
-      ;(this.port1 = new window.EventTarget()).postMessage = () => {}
-      ;(this.port2 = new window.EventTarget()).postMessage = () => {}
-    }
-
-    window.matchMedia = () => ({ addListener() {} })
-
-    if (!window.navigator) window.navigator = {}
-    window.navigator.serviceWorker = {
-      register: () => new BrokenPromise(),
-    }
-
-    window.PRERENDER = true
-
-    window.require = (moduleId) => {
-      const asset = compilation.assets[moduleId.replace(/^\.?\//g, "")]
-      if (!asset) {
-        try {
-          return require(moduleId)
-        } catch (e) {
-          throw Error(
-            `Error:  Module not found. attempted require("${moduleId}")`
-          )
-        }
-      }
-      const mod = { exports: {} }
-      window.eval(
-        `(function(exports, module, require){\n${asset.source()}\n})`
-      )(mod.exports, mod, window.require)
-      return mod.exports
-    }
-
-    result = window.eval(output + "\nPRERENDER_RESULT")
+    result = tpl.replace(HTML_TAG, msg)
   }
 
-  if (result && typeof result === "object") {
-    result = getBestModuleExport(result)
-  }
+  // exec clear
+  await promiseSpawnWithReturnData({
+    command: "rm",
+    args: ["-rf", tmpdir],
+  })
 
-  if (typeof result === "function") {
-    result = result(options.params || null)
-  }
-
-  if (result && result.then) {
-    result = await result
-  }
-
-  if (result !== undefined && options.templateContent) {
-    const template = window.document.createElement("template")
-    template.innerHTML = result || ""
-    const content = template.content || template
-    const parent = injectParent || window.document.body
-    let child
-    while ((child = content.firstChild)) {
-      parent.insertBefore(child, injectNextSibling || null)
-    }
-  } else if (inject) {
-    return options.templateContent.replace(PRERENDER_REG, result || "")
-  }
-
-  let serialized = dom.serialize()
-  if (!/^<!DOCTYPE /im.test(serialized)) {
-    serialized = `<!DOCTYPE html>${serialized}`
-  }
-  return serialized
+  return result
 }
 
 module.exports = PrerenderLoader
