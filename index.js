@@ -1,195 +1,213 @@
-const path = require("path")
-const Prerenderer = require("@prerenderer/prerenderer")
-const PuppeteerRenderer = require("@prerenderer/renderer-puppeteer")
-const { minify } = require("html-minifier")
-const fs = require("fs")
+const os = require("os")
+const jsdom = require("jsdom")
+const LibraryTemplatePlugin = require("webpack/lib/LibraryTemplatePlugin")
+const NodeTemplatePlugin = require("webpack/lib/node/NodeTemplatePlugin")
+const NodeTargetPlugin = require("webpack/lib/node/NodeTargetPlugin")
+const DefinePlugin = require("webpack/lib/DefinePlugin")
+const MemoryFs = require("memory-fs")
+const {
+  runChildCompiler,
+  getRootCompiler,
+  getBestModuleExport,
+  stringToModule,
+  normalizeEntry,
+  applyEntry,
+} = require("./util")
 
-function PrePlugin(...args) {
-  const rendererOptions = {}
+const PLUGIN_NAME = "prerender-loader"
 
-  this._options = {}
+const FILENAME = "ssr-bundle.js"
 
-  // Normal args object.
-  if (args.length === 1) {
-    this._options = args[0] || {}
-  } else {
-    console.warn(
-      "[pre-plugin] You appear to be using the v2 argument-based configuration options. It's recommended that you migrate to the clearer object-based configuration system.\nCheck the documentation for more information."
-    )
-    let staticDir, routes
+const PRERENDER_REG = /\{\{prerender(?::\s*([^}]+?)\s*)?\}\}/
 
-    args.forEach((arg) => {
-      if (typeof arg === "string") staticDir = arg
-      else if (Array.isArray(arg)) routes = arg
-      else if (typeof arg === "object") this._options = arg
+function PrerenderLoader(content) {
+  const options = this.getOptions() || {}
+  const outputFilter =
+    options.as === "string" || options.string ? stringToModule : String
+
+  if (options.disabled === true) {
+    return outputFilter(content)
+  }
+
+  let inject = false
+  if (!this.request.match(/\.(js|ts)x?$/i)) {
+    const matches = content.match(PRERENDER_REG)
+    if (matches) {
+      inject = true
+      options.entry = matches[1] || options.entry
+    }
+    options.templateContent = content
+  }
+
+  const callback = this.async()
+
+  prerender(this._compilation, this.request, options, inject, this)
+    .then((output) => {
+      callback(null, outputFilter(output))
     })
-
-    staticDir ? (this._options.staticDir = staticDir) : null
-    routes ? (this._options.routes = routes) : null
-  }
-
-  if (this._options.captureAfterDocumentEvent) {
-    console.warn(
-      "[pre-plugin] captureAfterDocumentEvent has been renamed to renderAfterDocumentEvent and should be moved to the renderer options."
-    )
-    rendererOptions.renderAfterDocumentEvent =
-      this._options.captureAfterDocumentEvent
-  }
-
-  if (this._options.captureAfterElementExists) {
-    console.warn(
-      "[pre-plugin] captureAfterElementExists has been renamed to renderAfterElementExists and should be moved to the renderer options."
-    )
-    rendererOptions.renderAfterElementExists =
-      this._options.captureAfterElementExists
-  }
-
-  if (this._options.captureAfterTime) {
-    console.warn(
-      "[pre-plugin] captureAfterTime has been renamed to renderAfterTime and should be moved to the renderer options."
-    )
-    rendererOptions.renderAfterTime = this._options.captureAfterTime
-  }
-
-  this._options.server = this._options.server || {}
-  this._options.renderer =
-    this._options.renderer ||
-    new PuppeteerRenderer(
-      Object.assign({}, { headless: true }, rendererOptions)
-    )
-
-  if (this._options.postProcessHtml) {
-    console.warn(
-      "[pre-plugin] postProcessHtml should be migrated to postProcess! Consult the documentation for more information."
-    )
-  }
+    .catch((err) => {
+      callback(err)
+    })
 }
 
-PrePlugin.prototype.apply = function (compiler) {
-  const compilerFS = compiler.outputFileSystem
+async function prerender(parentCompilation, request, options, inject, loader) {
+  const parentCompiler = getRootCompiler(parentCompilation.compiler)
+  const context = parentCompiler.options.context || process.cwd()
+  const customEntry =
+    options.entry && ([].concat(options.entry).pop() || "").trim()
+  const entry = customEntry
+    ? "./" + customEntry
+    : normalizeEntry(context, parentCompiler.options.entry, "./")
 
-  const mkdirp = function (dir, opts = {}) {
-    return new Promise((resolve, reject) => {
-      opts.recursive = true
-      fs.mkdir(dir, opts, (err, made) =>
-        err === null ? resolve(made) : reject(err)
-      )
-    })
+  const outputOptions = {
+    path: os.tmpdir(),
+    filename: FILENAME,
   }
 
-  const afterEmit = (compilation, done) => {
-    const PrerendererInstance = new Prerenderer(this._options)
+  const allowedPlugins = /(MiniCssExtractPlugin|ExtractTextPlugin)/i
+  const plugins = (parentCompiler.options.plugins || []).filter((c) =>
+    allowedPlugins.test(c.constructor.name)
+  )
 
-    PrerendererInstance.initialize()
-      .then(() => {
-        return PrerendererInstance.renderRoutes(this._options.routes || [])
-      })
-      .then((renderedRoutes) =>
-        this._options.postProcessHtml
-          ? renderedRoutes.map((renderedRoute) => {
-              const processed = this._options.postProcessHtml(renderedRoute)
-              if (typeof processed === "string") renderedRoute.html = processed
-              else renderedRoute = processed
+  const compiler = parentCompilation.createChildCompiler(
+    "prerender",
+    outputOptions,
+    plugins
+  )
+  compiler.context = parentCompiler.context
+  compiler.outputFileSystem = new MemoryFs()
 
-              return renderedRoute
-            })
-          : renderedRoutes
-      )
-      .then((renderedRoutes) =>
-        this._options.postProcess
-          ? Promise.all(
-              renderedRoutes.map((renderedRoute) =>
-                this._options.postProcess(renderedRoute)
-              )
-            )
-          : renderedRoutes
-      )
-      .then((renderedRoutes) => {
-        const isValid = renderedRoutes.every((r) => typeof r === "object")
-        if (!isValid) {
-          throw new Error(
-            "[pre-plugin] Rendered routes are empty, did you forget to return the `context` object in postProcess?"
+  new DefinePlugin({
+    PRERENDER: "true",
+  }).apply(compiler)
+
+  new DefinePlugin({
+    PRERENDER: "false",
+  }).apply(parentCompiler)
+
+  new NodeTemplatePlugin(outputOptions).apply(compiler)
+  new NodeTargetPlugin().apply(compiler)
+
+  new LibraryTemplatePlugin("PRERENDER_RESULT", "var").apply(compiler)
+
+  applyEntry(context, entry, compiler)
+
+  const compilation = await runChildCompiler(compiler)
+  let result
+  let dom, window, injectParent, injectNextSibling
+
+  function BrokenPromise() {}
+  BrokenPromise.prototype.then =
+    BrokenPromise.prototype.catch =
+    BrokenPromise.prototype.finally =
+      () => new BrokenPromise()
+
+  if (compilation.assets[compilation.options.output.filename]) {
+    const output =
+      compilation.assets[compilation.options.output.filename].source()
+
+    const tpl =
+      options.templateContent ||
+      "<!DOCTYPE html><html><head></head><body></body></html>"
+    dom = new jsdom.JSDOM(
+      tpl.replace(PRERENDER_REG, '<div id="PRERENDER_INJECT"></div>'),
+      {
+        virtualConsole: new jsdom.VirtualConsole({
+          omitJSDOMErrors: false,
+        }).sendTo(console),
+
+        url: options.documentUrl || "http://localhost",
+
+        includeNodeLocations: false,
+
+        runScripts: "outside-only",
+      }
+    )
+    window = dom.window
+
+    const injectPlaceholder = window.document.getElementById("PRERENDER_INJECT")
+    if (injectPlaceholder) {
+      injectParent = injectPlaceholder.parentNode
+      injectNextSibling = injectPlaceholder.nextSibling
+      injectPlaceholder.remove()
+    }
+
+    let counter = 0
+    window.requestAnimationFrame = () => ++counter
+    window.cancelAnimationFrame = () => {}
+
+    window.customElements = {
+      define() {},
+      get() {},
+      upgrade() {},
+      whenDefined: () => new BrokenPromise(),
+    }
+
+    window.MessagePort = function () {
+      ;(this.port1 = new window.EventTarget()).postMessage = () => {}
+      ;(this.port2 = new window.EventTarget()).postMessage = () => {}
+    }
+
+    window.matchMedia = () => ({ addListener() {} })
+
+    if (!window.navigator) window.navigator = {}
+    window.navigator.serviceWorker = {
+      register: () => new BrokenPromise(),
+    }
+
+    window.PRERENDER = true
+
+    window.require = (moduleId) => {
+      const asset = compilation.assets[moduleId.replace(/^\.?\//g, "")]
+      if (!asset) {
+        try {
+          return require(moduleId)
+        } catch (e) {
+          throw Error(
+            `Error:  Module not found. attempted require("${moduleId}")`
           )
         }
+      }
+      const mod = { exports: {} }
+      window.eval(
+        `(function(exports, module, require){\n${asset.source()}\n})`
+      )(mod.exports, mod, window.require)
+      return mod.exports
+    }
 
-        return renderedRoutes
-      })
-      .then((renderedRoutes) => {
-        if (!this._options.minify) return renderedRoutes
-
-        renderedRoutes.forEach((route) => {
-          route.html = minify(route.html, this._options.minify)
-        })
-
-        return renderedRoutes
-      })
-      .then((renderedRoutes) => {
-        renderedRoutes.forEach((rendered) => {
-          if (!rendered.outputPath) {
-            rendered.outputPath = path.join(
-              this._options.outputDir || this._options.staticDir,
-              rendered.route,
-              "index.html"
-            )
-          }
-        })
-
-        return renderedRoutes
-      })
-      .then((processedRoutes) => {
-        const promises = Promise.all(
-          processedRoutes.map((processedRoute) => {
-            return mkdirp(path.dirname(processedRoute.outputPath))
-              .then(() => {
-                return new Promise((resolve, reject) => {
-                  compilerFS.writeFile(
-                    processedRoute.outputPath,
-                    processedRoute.html.trim(),
-                    (err) => {
-                      if (err)
-                        reject(
-                          `[pre-plugin] Unable to write rendered route to file "${processedRoute.outputPath}" \n ${err}.`
-                        )
-                      else resolve()
-                    }
-                  )
-                })
-              })
-              .catch((err) => {
-                if (typeof err === "string") {
-                  err = `[pre-plugin] Unable to create directory ${path.dirname(
-                    processedRoute.outputPath
-                  )} for route ${processedRoute.route}. \n ${err}`
-                }
-
-                throw err
-              })
-          })
-        )
-
-        return promises
-      })
-      .then((r) => {
-        PrerendererInstance.destroy()
-        done()
-      })
-      .catch((err) => {
-        PrerendererInstance.destroy()
-        const msg = "[pre-plugin] Unable to prerender all routes!"
-        console.error(msg)
-        compilation.errors.push(new Error(msg))
-        done()
-      })
+    result = window.eval(output + "\nPRERENDER_RESULT")
   }
 
-  if (compiler.hooks) {
-    const plugin = { name: "PrePlugin" }
-    compiler.hooks.afterEmit.tapAsync(plugin, afterEmit)
-  } else {
-    compiler.plugin("after-emit", afterEmit)
+  if (result && typeof result === "object") {
+    result = getBestModuleExport(result)
   }
+
+  if (typeof result === "function") {
+    result = result(options.params || null)
+  }
+
+  if (result && result.then) {
+    result = await result
+  }
+
+  if (result !== undefined && options.templateContent) {
+    const template = window.document.createElement("template")
+    template.innerHTML = result || ""
+    const content = template.content || template
+    const parent = injectParent || window.document.body
+    let child
+    while ((child = content.firstChild)) {
+      parent.insertBefore(child, injectNextSibling || null)
+    }
+  } else if (inject) {
+    return options.templateContent.replace(PRERENDER_REG, result || "")
+  }
+
+  let serialized = dom.serialize()
+  if (!/^<!DOCTYPE /im.test(serialized)) {
+    serialized = `<!DOCTYPE html>${serialized}`
+  }
+  return serialized
 }
 
-PrePlugin.PuppeteerRenderer = PuppeteerRenderer
-
-module.exports = PrePlugin
+module.exports = PrerenderLoader
